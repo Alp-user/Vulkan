@@ -4,12 +4,20 @@ import "core:fmt"
 import "core:os"
 import "vendor:glfw"
 import vk "vendor:vulkan"
-
+import "base:runtime"
+import "base:builtin"
+import "core:mem"
 
 WIDTH :: 800
 HEIGHT :: 800
 MAX_FRAMES_IN_FLIGHT :: 2
 
+vertices := [3]Vertex {
+	Vertex{pos = {0.0, -0.5}, color = {0.0, 0.0, 1.0}},
+	Vertex{pos = {0.5, 0.5}, color = {0.0, 1.0, 0.0}},
+	Vertex{pos = {-0.5, 0.5}, color = {0.0, 0.0, 1.0}},
+}
+vs_buffer_offsets := []vk.DeviceSize{0}
 
 // All Vulkan/GLFW handles and per-frame state live in one struct so they can be
 // shared across the helper procs without long parameter lists.
@@ -29,7 +37,7 @@ vk_state := struct {
 	command_pool:        	vk.CommandPool,
 	command_buffers:     	[MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer,
 	present_complete_sems:	[MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
-	render_finished_sems: 	[MAX_FRAMES_IN_FLIGHT]vk.Semaphore,
+	render_finished_sems: 	[]vk.Semaphore,
 	in_flight_fences:	 	[MAX_FRAMES_IN_FLIGHT]vk.Fence,
 	extent:              	vk.Extent2D,
 	viewport:            	vk.Viewport,
@@ -38,25 +46,41 @@ vk_state := struct {
 	present_mode: 			vk.PresentModeKHR,
 	image_index:         	u32,
 	frame_index: 			u32,
+	vs_buffer : 			vk.Buffer,
+	vs_buffer_memory : 		vk.DeviceMemory
 }{}
+
+Vertex :: struct 
+{
+	pos : [2]f32,
+	color : [3]f32,
+}
+
+get_binding_description :: proc() -> vk.VertexInputBindingDescription
+{
+	binding_description := vk.VertexInputBindingDescription {
+		binding = 0,
+		stride = size_of(Vertex),
+		inputRate = .VERTEX,
+	}
+	return binding_description
+}
+
+get_attribute_descriptions :: proc() -> [2]vk.VertexInputAttributeDescription
+{
+	return {
+		vk.VertexInputAttributeDescription{location = 0, binding = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
+		vk.VertexInputAttributeDescription{location = 1, binding = 0, format = .R32G32B32_SFLOAT, offset = u32(offset_of(Vertex, color))}
+	}
+}
+
+
 
 clamp :: proc(value: $T, min: T, max: T) -> T {
 	final_value := value > max ? max : value
 	return final_value < min ? min : final_value
 }
 
-// Transitions the swapchain image at image_index between layouts using
-// synchronization2 barriers. Requires the synchronization2 device feature.
-transition_image_layout :: proc(
-	image_index: u32,
-	old_layout: vk.ImageLayout,
-	new_layout: vk.ImageLayout,
-	src_access_mask: vk.AccessFlags2,
-	dst_access_mask: vk.AccessFlags2,
-	src_stage_mask: vk.PipelineStageFlags2,
-	dst_stage_mask: vk.PipelineStageFlags2,
-) {
-}
 
 record_command_buffer :: proc() {
 	command_buffer := vk_state.command_buffers[vk_state.frame_index]
@@ -71,7 +95,7 @@ record_command_buffer :: proc() {
 
 	barrier := vk.ImageMemoryBarrier2 {
 		sType = .IMAGE_MEMORY_BARRIER_2,
-		srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+		srcStageMask = {.TOP_OF_PIPE},
 		dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
 		srcAccessMask = {},
 		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
@@ -119,8 +143,36 @@ record_command_buffer :: proc() {
 	vk.CmdBindPipeline(command_buffer, .GRAPHICS, vk_state.graphics_pipeline)
 	vk.CmdSetViewport(command_buffer, 0, 1, &vk_state.viewport)
 	vk.CmdSetScissor(command_buffer, 0, 1, &vk_state.scissor)
-	vk.CmdDraw(command_buffer, 3, 1, 0, 0)
+	vk.CmdBindVertexBuffers(command_buffer, 0, 1, &vk_state.vs_buffer, raw_data(vs_buffer_offsets))
+	vk.CmdDraw(command_buffer, u32(len(vertices)), 1, 0, 0)
 	vk.CmdEndRendering(command_buffer)
+
+	barrier = vk.ImageMemoryBarrier2 {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+		dstStageMask = {.BOTTOM_OF_PIPE},
+		srcAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		dstAccessMask = {},
+		oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		newLayout = .PRESENT_SRC_KHR,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = vk_state.swapchain_images[vk_state.image_index],
+		subresourceRange = vk.ImageSubresourceRange {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+	dependency_info = vk.DependencyInfo {
+		sType                   = .DEPENDENCY_INFO,
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+	vk.CmdPipelineBarrier2(vk_state.command_buffers[vk_state.frame_index], &dependency_info)
+
 
 	// ColorAttachmentOptimal -> PresentSrcKHR, so the image can be presented.
 	result = vk.EndCommandBuffer(command_buffer)
@@ -159,7 +211,7 @@ draw_frame :: proc() {
 		commandBufferCount = 1,
 		pCommandBuffers = &vk_state.command_buffers[vk_state.frame_index],
 		signalSemaphoreCount = 1,
-		pSignalSemaphores = &vk_state.render_finished_sems[vk_state.frame_index],
+		pSignalSemaphores = &vk_state.render_finished_sems[vk_state.image_index],
 	}
 	vk.QueueSubmit(vk_state.queue, 1, &submit_info, vk_state.in_flight_fences[vk_state.frame_index])
 
@@ -167,7 +219,7 @@ draw_frame :: proc() {
 	present_info_khr := vk.PresentInfoKHR {
 		sType = .PRESENT_INFO_KHR,
 		waitSemaphoreCount = 1,
-		pWaitSemaphores = &vk_state.render_finished_sems[vk_state.frame_index],
+		pWaitSemaphores = &vk_state.render_finished_sems[vk_state.image_index],
 		swapchainCount = 1,
 		pSwapchains = &vk_state.swapchain,
 		pImageIndices = &vk_state.image_index,
@@ -233,7 +285,7 @@ check_instance_extensions :: proc() -> ([]cstring, bool)
 
 when ODIN_DEBUG
 {
-	check_validation_layers :: proc(validation_layers : []cstring ) -> bool
+check_validation_layers :: proc(validation_layers : []cstring ) -> bool
 	{
 	    layer_count: u32
 		result := vk.EnumerateInstanceLayerProperties(&layer_count, nil)
@@ -615,6 +667,21 @@ choose_present_mode :: proc(physical_device : vk.PhysicalDevice, surface : vk.Su
     return chosen_present_mode
 }
 
+choose_memory_type :: proc(physical_device : vk.PhysicalDevice, type_filter : u32, properties: vk.MemoryPropertyFlags) -> u32
+{
+	memory_properties : vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(physical_device, &memory_properties)
+
+	for i in 0..<memory_properties.memoryTypeCount
+	{
+		if (type_filter & (i<<1) != 0) && (properties <= memory_properties.memoryTypes[i].propertyFlags)
+		{
+			return u32(i)
+		}
+	}
+	return 0
+}
+
 
 main :: proc() {
 	result: vk.Result
@@ -633,7 +700,7 @@ main :: proc() {
     }
 
 
-    validation_layers := [?]cstring{"something name find this"}
+    validation_layers := [?]cstring{"VK_LAYER_KHRONOS_validation"}
     when ODIN_DEBUG
     {
 	    if !check_validation_layers(validation_layers[:])
@@ -665,16 +732,18 @@ main :: proc() {
 
 
 	required_device_extensions := [?]cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
-    if check_device_extensions(required_device_extensions[:], vk_state.physical_device)
+    if ok := check_device_extensions(required_device_extensions[:], vk_state.physical_device); !ok
     {
         panic("Required device extensions are not supported")
     }
 
-    if device, ok := create_logical_device(vk_state.queue_family_index, vk_state.physical_device, required_device_extensions[:]); !ok
+    device : vk.Device
+    if device, ok = create_logical_device(vk_state.queue_family_index, vk_state.physical_device, required_device_extensions[:]); !ok
     {
         panic("Logical device couldn't be created")
     }
 	defer vk.DestroyDevice(vk_state.logical_device, nil)
+	vk_state.logical_device = device
 
 	// Vulkan: Get queue handle
 	vk.GetDeviceQueue(vk_state.logical_device, vk_state.queue_family_index, 0, &vk_state.queue)
@@ -703,24 +772,30 @@ main :: proc() {
 		flags = {.SIGNALED},
 	}
 
-	for i in 0..<2
+	for i in 0..<MAX_FRAMES_IN_FLIGHT
 	{
 		vk.CreateSemaphore(vk_state.logical_device, &create_sem_info, nil, &vk_state.present_complete_sems[i])
-		vk.CreateSemaphore(vk_state.logical_device, &create_sem_info, nil, &vk_state.render_finished_sems[i])
 		vk.CreateFence(vk_state.logical_device, &draw_fence_create_info, nil, &vk_state.in_flight_fences[i])
 	}
 
+	vk_state.render_finished_sems = make([]vk.Semaphore, len(vk_state.swapchain_images))
+	defer delete(vk_state.render_finished_sems)
 	for i in 0..<len(vk_state.swapchain_images)
 	{
-
+		vk.CreateSemaphore(vk_state.logical_device, &create_sem_info, nil, &vk_state.render_finished_sems[i])
 	}
 
 	defer {
-		for i in 0..<2
+
+		for i in 0..<MAX_FRAMES_IN_FLIGHT
 		{
-			defer vk.DestroySemaphore(vk_state.logical_device, vk_state.present_complete_sems[i], nil)
-			defer vk.DestroySemaphore(vk_state.logical_device, vk_state.render_finished_sems[i], nil)
-			defer vk.DestroyFence(vk_state.logical_device, vk_state.in_flight_fences[i], nil)
+			vk.DestroySemaphore(vk_state.logical_device, vk_state.present_complete_sems[i], nil)
+			vk.DestroyFence(vk_state.logical_device, vk_state.in_flight_fences[i], nil)
+		}
+
+		for i in 0..<len(vk_state.swapchain_images)
+		{
+			vk.DestroySemaphore(vk_state.logical_device, vk_state.render_finished_sems[i], nil)
 		}
 	}
 
@@ -860,6 +935,50 @@ main :: proc() {
 		layout              = vk_state.pipeline_layout,
 		renderPass          = {},
 	}
+
+	vs_binding_description := get_binding_description()
+	vs_attribute_descriptions := get_attribute_descriptions()
+	vs_input_state_create_info := vk.PipelineVertexInputStateCreateInfo {
+		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount = 1, 
+		pVertexBindingDescriptions = &vs_binding_description,
+		vertexAttributeDescriptionCount = len(vs_attribute_descriptions),
+		pVertexAttributeDescriptions = raw_data(vs_attribute_descriptions[:])
+	}
+
+	buffer_create_info := vk.BufferCreateInfo {
+		sType = .BUFFER_CREATE_INFO,
+		size = size_of(Vertex) * len(vertices),
+		usage = {.VERTEX_BUFFER}, 
+		sharingMode = .EXCLUSIVE,
+	}
+	if result := vk.CreateBuffer(vk_state.logical_device, &buffer_create_info, nil, &vk_state.vs_buffer); result != .SUCCESS 
+	{
+		panic("Vertex buffer couldn't be created")
+	}
+	defer vk.DestroyBuffer(vk_state.logical_device, vk_state.vs_buffer, nil)
+
+	vs_buffer_mem_requirement : vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(vk_state.logical_device, vk_state.vs_buffer, &vs_buffer_mem_requirement)
+	vs_buffer_mem_alloc_info := vk.MemoryAllocateInfo {
+		sType = .MEMORY_ALLOCATE_INFO,
+		allocationSize = vs_buffer_mem_requirement.size,
+		memoryTypeIndex = choose_memory_type(vk_state.physical_device, vs_buffer_mem_requirement.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT})
+	}
+	if result := vk.AllocateMemory(vk_state.logical_device, &vs_buffer_mem_alloc_info, nil, &vk_state.vs_buffer_memory); result != .SUCCESS 
+	{
+		panic("couldn't allocate memory for the buffer")
+	}
+	defer vk.FreeMemory(vk_state.logical_device, vk_state.vs_buffer_memory, nil)
+	vk.BindBufferMemory(vk_state.logical_device, vk_state.vs_buffer, vk_state.vs_buffer_memory, 0)
+	buffer_memory : rawptr
+	if result := vk.MapMemory(vk_state.logical_device, vk_state.vs_buffer_memory, 0, vs_buffer_mem_requirement.size, {}, &buffer_memory); result != .SUCCESS 
+	{
+		panic("couldn't map memory for buffer")
+	}
+	mem.copy(buffer_memory, raw_data(vertices[:]), int(vs_buffer_mem_requirement.size))
+	vk.UnmapMemory(vk_state.logical_device, vk_state.vs_buffer_memory)
+
 
 
 	result = vk.CreateGraphicsPipelines(
