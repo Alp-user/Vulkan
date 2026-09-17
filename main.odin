@@ -531,6 +531,38 @@ create_swapchain_with_images :: proc(physical_device : vk.PhysicalDevice, logica
 
 }
 
+create_buffer :: proc(physical_device : vk.PhysicalDevice, logical_device : vk.Device, buffer_size : vk.DeviceSize, usage_flags : vk.BufferUsageFlags, properties_flags : vk.MemoryPropertyFlags) -> (vk.Buffer, vk.DeviceMemory)
+{
+	buffer_create_info := vk.BufferCreateInfo {
+		sType = .BUFFER_CREATE_INFO,
+		size = buffer_size, 
+		usage = usage_flags, 
+		sharingMode = .EXCLUSIVE,
+	}
+	buffer : vk.Buffer
+	memory : vk.DeviceMemory
+	if result := vk.CreateBuffer(logical_device, &buffer_create_info, nil, &buffer); result != .SUCCESS 
+	{
+		panic("Vertex buffer couldn't be created")
+	}
+
+	vs_buffer_mem_requirement : vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(logical_device, buffer, &vs_buffer_mem_requirement)
+	vs_buffer_mem_alloc_info := vk.MemoryAllocateInfo {
+		sType = .MEMORY_ALLOCATE_INFO,
+		allocationSize = vs_buffer_mem_requirement.size,
+		memoryTypeIndex = choose_memory_type(physical_device, vs_buffer_mem_requirement.memoryTypeBits, properties_flags)
+	}
+	if result := vk.AllocateMemory(logical_device, &vs_buffer_mem_alloc_info, nil, &memory); result != .SUCCESS 
+	{
+		panic("couldn't allocate memory for the buffer")
+	}
+	vk.BindBufferMemory(logical_device, buffer, memory, 0)
+	return buffer, memory
+}
+
+
+
 choose_physical_device :: proc(instance : vk.Instance) -> vk.PhysicalDevice
 {
 	physical_devices_count: u32
@@ -845,9 +877,6 @@ main :: proc() {
 		dynamicStateCount = len(dynamic_states),
 		pDynamicStates    = raw_data(dynamic_states[:]),
 	}
-	vertex_input_info := vk.PipelineVertexInputStateCreateInfo {
-		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-	}
 	input_assembly_create_info := vk.PipelineInputAssemblyStateCreateInfo {
 		sType    = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
 		topology = .TRIANGLE_LIST,
@@ -920,21 +949,6 @@ main :: proc() {
 		pColorAttachmentFormats = &vk_state.surface_format.format,
 	}
 
-	graphics_pipeline_create_info := vk.GraphicsPipelineCreateInfo {
-		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
-		pNext               = &pipeline_rendering_create_info,
-		stageCount          = 2,
-		pStages             = raw_data(pipeline_shader_stage_create_info[:]),
-		pVertexInputState   = &vertex_input_info,
-		pInputAssemblyState = &input_assembly_create_info,
-		pViewportState      = &viewport_create_info,
-		pRasterizationState = &rasterization_create_info,
-		pMultisampleState   = &multisample_create_info,
-		pColorBlendState    = &color_blend_create_info,
-		pDynamicState       = &dynamic_state_create_info,
-		layout              = vk_state.pipeline_layout,
-		renderPass          = {},
-	}
 
 	vs_binding_description := get_binding_description()
 	vs_attribute_descriptions := get_attribute_descriptions()
@@ -946,37 +960,32 @@ main :: proc() {
 		pVertexAttributeDescriptions = raw_data(vs_attribute_descriptions[:])
 	}
 
-	buffer_create_info := vk.BufferCreateInfo {
-		sType = .BUFFER_CREATE_INFO,
-		size = size_of(Vertex) * len(vertices),
-		usage = {.VERTEX_BUFFER}, 
-		sharingMode = .EXCLUSIVE,
+	graphics_pipeline_create_info := vk.GraphicsPipelineCreateInfo {
+		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+		pNext               = &pipeline_rendering_create_info,
+		stageCount          = 2,
+		pStages             = raw_data(pipeline_shader_stage_create_info[:]),
+		pVertexInputState   = &vs_input_state_create_info,
+		pInputAssemblyState = &input_assembly_create_info,
+		pViewportState      = &viewport_create_info,
+		pRasterizationState = &rasterization_create_info,
+		pMultisampleState   = &multisample_create_info,
+		pColorBlendState    = &color_blend_create_info,
+		pDynamicState       = &dynamic_state_create_info,
+		layout              = vk_state.pipeline_layout,
+		renderPass          = {},
 	}
-	if result := vk.CreateBuffer(vk_state.logical_device, &buffer_create_info, nil, &vk_state.vs_buffer); result != .SUCCESS 
-	{
-		panic("Vertex buffer couldn't be created")
-	}
-	defer vk.DestroyBuffer(vk_state.logical_device, vk_state.vs_buffer, nil)
 
-	vs_buffer_mem_requirement : vk.MemoryRequirements
-	vk.GetBufferMemoryRequirements(vk_state.logical_device, vk_state.vs_buffer, &vs_buffer_mem_requirement)
-	vs_buffer_mem_alloc_info := vk.MemoryAllocateInfo {
-		sType = .MEMORY_ALLOCATE_INFO,
-		allocationSize = vs_buffer_mem_requirement.size,
-		memoryTypeIndex = choose_memory_type(vk_state.physical_device, vs_buffer_mem_requirement.memoryTypeBits, {.HOST_VISIBLE, .HOST_COHERENT})
-	}
-	if result := vk.AllocateMemory(vk_state.logical_device, &vs_buffer_mem_alloc_info, nil, &vk_state.vs_buffer_memory); result != .SUCCESS 
-	{
-		panic("couldn't allocate memory for the buffer")
-	}
+	buffer_size : vk.DeviceSize = len(vertices) * size_of(Vertex)
+	vk_state.vs_buffer, vk_state.vs_buffer_memory = create_buffer(vk_state.physical_device, vk_state.logical_device, buffer_size,{.VERTEX_BUFFER}, {.HOST_COHERENT, .HOST_VISIBLE} )
 	defer vk.FreeMemory(vk_state.logical_device, vk_state.vs_buffer_memory, nil)
-	vk.BindBufferMemory(vk_state.logical_device, vk_state.vs_buffer, vk_state.vs_buffer_memory, 0)
+	defer vk.DestroyBuffer(vk_state.logical_device, vk_state.vs_buffer, nil)
 	buffer_memory : rawptr
-	if result := vk.MapMemory(vk_state.logical_device, vk_state.vs_buffer_memory, 0, vs_buffer_mem_requirement.size, {}, &buffer_memory); result != .SUCCESS 
+	if result := vk.MapMemory(vk_state.logical_device, vk_state.vs_buffer_memory, 0, buffer_size, {}, &buffer_memory); result != .SUCCESS 
 	{
 		panic("couldn't map memory for buffer")
 	}
-	mem.copy(buffer_memory, raw_data(vertices[:]), int(vs_buffer_mem_requirement.size))
+	mem.copy(buffer_memory, raw_data(vertices[:]), int(buffer_size))
 	vk.UnmapMemory(vk_state.logical_device, vk_state.vs_buffer_memory)
 
 
