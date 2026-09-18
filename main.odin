@@ -50,7 +50,7 @@ vk_state := struct {
 	vs_buffer_memory : 		vk.DeviceMemory
 }{}
 
-Vertex :: struct 
+Vertex :: struct
 {
 	pos : [2]f32,
 	color : [3]f32,
@@ -535,13 +535,13 @@ create_buffer :: proc(physical_device : vk.PhysicalDevice, logical_device : vk.D
 {
 	buffer_create_info := vk.BufferCreateInfo {
 		sType = .BUFFER_CREATE_INFO,
-		size = buffer_size, 
-		usage = usage_flags, 
+		size = buffer_size,
+		usage = usage_flags,
 		sharingMode = .EXCLUSIVE,
 	}
 	buffer : vk.Buffer
 	memory : vk.DeviceMemory
-	if result := vk.CreateBuffer(logical_device, &buffer_create_info, nil, &buffer); result != .SUCCESS 
+	if result := vk.CreateBuffer(logical_device, &buffer_create_info, nil, &buffer); result != .SUCCESS
 	{
 		panic("Vertex buffer couldn't be created")
 	}
@@ -553,7 +553,7 @@ create_buffer :: proc(physical_device : vk.PhysicalDevice, logical_device : vk.D
 		allocationSize = vs_buffer_mem_requirement.size,
 		memoryTypeIndex = choose_memory_type(physical_device, vs_buffer_mem_requirement.memoryTypeBits, properties_flags)
 	}
-	if result := vk.AllocateMemory(logical_device, &vs_buffer_mem_alloc_info, nil, &memory); result != .SUCCESS 
+	if result := vk.AllocateMemory(logical_device, &vs_buffer_mem_alloc_info, nil, &memory); result != .SUCCESS
 	{
 		panic("couldn't allocate memory for the buffer")
 	}
@@ -954,7 +954,7 @@ main :: proc() {
 	vs_attribute_descriptions := get_attribute_descriptions()
 	vs_input_state_create_info := vk.PipelineVertexInputStateCreateInfo {
 		sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-		vertexBindingDescriptionCount = 1, 
+		vertexBindingDescriptionCount = 1,
 		pVertexBindingDescriptions = &vs_binding_description,
 		vertexAttributeDescriptionCount = len(vs_attribute_descriptions),
 		pVertexAttributeDescriptions = raw_data(vs_attribute_descriptions[:])
@@ -976,31 +976,6 @@ main :: proc() {
 		renderPass          = {},
 	}
 
-	buffer_size : vk.DeviceSize = len(vertices) * size_of(Vertex)
-	vk_state.vs_buffer, vk_state.vs_buffer_memory = create_buffer(vk_state.physical_device, vk_state.logical_device, buffer_size,{.VERTEX_BUFFER}, {.HOST_COHERENT, .HOST_VISIBLE} )
-	defer vk.FreeMemory(vk_state.logical_device, vk_state.vs_buffer_memory, nil)
-	defer vk.DestroyBuffer(vk_state.logical_device, vk_state.vs_buffer, nil)
-	buffer_memory : rawptr
-	if result := vk.MapMemory(vk_state.logical_device, vk_state.vs_buffer_memory, 0, buffer_size, {}, &buffer_memory); result != .SUCCESS 
-	{
-		panic("couldn't map memory for buffer")
-	}
-	mem.copy(buffer_memory, raw_data(vertices[:]), int(buffer_size))
-	vk.UnmapMemory(vk_state.logical_device, vk_state.vs_buffer_memory)
-
-
-
-	result = vk.CreateGraphicsPipelines(
-		vk_state.logical_device,
-		0,
-		1,
-		&graphics_pipeline_create_info,
-		nil,
-		&vk_state.graphics_pipeline,
-	)
-	defer vk.DestroyPipeline(vk_state.logical_device, vk_state.graphics_pipeline, nil)
-	assert(result == .SUCCESS)
-
 	command_pool_create_info := vk.CommandPoolCreateInfo {
 		sType            = .COMMAND_POOL_CREATE_INFO,
 		flags            = {.RESET_COMMAND_BUFFER},
@@ -1013,6 +988,56 @@ main :: proc() {
 		&vk_state.command_pool,
 	)
 	defer vk.DestroyCommandPool(vk_state.logical_device, vk_state.command_pool, nil)
+	assert(result == .SUCCESS)
+
+
+	buffer_size : vk.DeviceSize = len(vertices) * size_of(Vertex)
+	vs_staging_buffer, vs_staging_buffer_memory := create_buffer(vk_state.physical_device, vk_state.logical_device, buffer_size,{.TRANSFER_SRC}, {.HOST_COHERENT, .HOST_VISIBLE} )
+	defer vk.FreeMemory(vk_state.logical_device, vs_staging_buffer_memory, nil)
+	defer vk.DestroyBuffer(vk_state.logical_device, vs_staging_buffer, nil)
+	buffer_memory : rawptr
+	if result := vk.MapMemory(vk_state.logical_device, vs_staging_buffer_memory, 0, buffer_size, {}, &buffer_memory); result != .SUCCESS
+	{
+		panic("couldn't map memory for buffer")
+	}
+	mem.copy(buffer_memory, raw_data(vertices[:]), int(buffer_size))
+	vk.UnmapMemory(vk_state.logical_device, vs_staging_buffer_memory)
+
+	vk_state.vs_buffer, vk_state.vs_buffer_memory = create_buffer(vk_state.physical_device, vk_state.logical_device, buffer_size, {.TRANSFER_DST, .VERTEX_BUFFER}, {.DEVICE_LOCAL})
+	defer vk.FreeMemory(vk_state.logical_device, vk_state.vs_buffer_memory, nil)
+	defer vk.DestroyBuffer(vk_state.logical_device, vk_state.vs_buffer, nil)
+
+	cmd_buffer_alloc_info := vk.CommandBufferAllocateInfo {
+		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool = vk_state.command_pool,
+		level = .PRIMARY,
+		commandBufferCount = 1,
+	}
+	cmd_buffer : vk.CommandBuffer
+	if result := vk.AllocateCommandBuffers(vk_state.logical_device, &cmd_buffer_alloc_info, &cmd_buffer); result != .SUCCESS {
+		panic("Command buffer to copy content to vertex shader buffer couldn't be created")
+	}
+	defer vk.FreeCommandBuffers(vk_state.logical_device, vk_state.command_pool, 1, &cmd_buffer)
+
+	cmd_begin_info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {.ONE_TIME_SUBMIT}
+	}
+	result = vk.BeginCommandBuffer(cmd_buffer, &cmd_begin_info)
+	vk.CmdCopyBuffer(cmd_buffer, vs_staging_buffer, vk_state.vs_buffer, 1, &vk.BufferCopy{0, 0, buffer_size})
+	result = vk.EndCommandBuffer(cmd_buffer)
+	vk.QueueSubmit(vk_state.queue, 1,&vk.SubmitInfo{sType = .SUBMIT_INFO, commandBufferCount = 1, pCommandBuffers = &cmd_buffer}, vk.Fence(0))
+	result = vk.QueueWaitIdle(vk_state.queue)
+
+	result = vk.CreateGraphicsPipelines(
+		vk_state.logical_device,
+		0,
+		1,
+		&graphics_pipeline_create_info,
+		nil,
+		&vk_state.graphics_pipeline,
+	)
+	defer vk.DestroyPipeline(vk_state.logical_device, vk_state.graphics_pipeline, nil)
 	assert(result == .SUCCESS)
 
 	command_buffer_create_info := vk.CommandBufferAllocateInfo {
